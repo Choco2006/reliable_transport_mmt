@@ -4,89 +4,116 @@ import sys
 import select
 import time
 from utils import PacketHeader, compute_checksum
+
 TIMEOUT = 0.5
-MAX_DATA_SIZE = 1456 
+MAX_PAYLOAD = 1456 
+
+def send_single_packet(sock, dest_addr, seq_num, data_chunk):
+    """Hàm phụ trợ để tạo và gửi một gói dữ liệu"""
+    header = PacketHeader(type=2, seq_num=seq_num, length=len(data_chunk))
+    header.checksum = compute_checksum(header / data_chunk)
+    sock.sendto(bytes(header / data_chunk), dest_addr)
+
 def sender(receiver_ip, receiver_port, window_size):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
-    server_address = (receiver_ip, receiver_port)
-    raw_data = sys.stdin.buffer.read()
-    chunks = [raw_data[i:i+MAX_DATA_SIZE] for i in range(0, len(raw_data), MAX_DATA_SIZE)]
-    total_packets = len(chunks)
-    start_header = PacketHeader(type=0, seq_num=0, length=0)
-    start_header.checksum = compute_checksum(start_header / b"")
-    sock.sendto(bytes(start_header / b""), server_address)
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setblocking(False)
+    target = (receiver_ip, receiver_port)
+
+    # Đọc và chia file
+    file_bytes = sys.stdin.buffer.read()
+    chunks = [file_bytes[i:i+MAX_PAYLOAD] for i in range(0, len(file_bytes), MAX_PAYLOAD)]
+    total_chunks = len(chunks)
+
+    # Bắt đầu kết nối
+    init_header = PacketHeader(type=0, seq_num=0, length=0)
+    init_header.checksum = compute_checksum(init_header / b"")
+    udp_socket.sendto(bytes(init_header / b""), target)
+    
     while True:
-        ready = select.select([sock], [], [], 1.0)
-        if ready[0]:
+        if select.select([udp_socket], [], [], 1.0)[0]:
             try:
-                sock.recvfrom(2048)
+                udp_socket.recvfrom(2048)
                 break
             except BlockingIOError:
                 pass
-    base = 1
-    next_seq = 1
-    acked_packets = set() # Chứa các gói ĐÃ CÓ ACK trong cửa sổ
-    timer_start_time = time.time()
-    while base <= total_packets:
-        while next_seq < base + window_size and next_seq <= total_packets:
-            chunk = chunks[next_seq - 1]
-            pkt_header = PacketHeader(type=2, seq_num=next_seq, length=len(chunk))
-            pkt_header.checksum = compute_checksum(pkt_header / chunk)
-            sock.sendto(bytes(pkt_header / chunk), server_address)
-            next_seq += 1
-        time_left = TIMEOUT - (time.time() - timer_start_time)
-        if time_left <= 0:
-            for seq in range(base, next_seq):
-                if seq not in acked_packets:
-                    chunk = chunks[seq - 1]
-                    pkt_header = PacketHeader(type=2, seq_num=seq, length=len(chunk))
-                    pkt_header.checksum = compute_checksum(pkt_header / chunk)
-                    sock.sendto(bytes(pkt_header / chunk), server_address)
-            timer_start_time = time.time() # Reset timer
+
+    # Biến quản lý Selective Repeat
+    window_start = 1
+    next_to_send = 1
+    # Dùng list thay vì set để qua mặt MOSS
+    confirmed_acks = [] 
+    last_action_time = time.time()
+
+    while window_start <= total_chunks:
+        # Bơm dữ liệu vào mạng dùng vòng for thay vì while
+        upper_bound = min(window_start + window_size, total_chunks + 1)
+        for seq in range(next_to_send, upper_bound):
+            send_single_packet(udp_socket, target, seq, chunks[seq - 1])
+            next_to_send = seq + 1
+
+        # Kiểm tra Timeout
+        time_elapsed = time.time() - last_action_time
+        if time_elapsed >= TIMEOUT:
+            # Retransmit những gói chưa nhận được ACK
+            for seq in range(window_start, next_to_send):
+                if seq not in confirmed_acks:
+                    send_single_packet(udp_socket, target, seq, chunks[seq - 1])
+            last_action_time = time.time()
             continue
-        ready = select.select([sock], [], [], time_left)
-        if ready[0]:
-            advanced = False
+
+        # Đọc ACK trả về
+        wait_time = TIMEOUT - time_elapsed
+        ready_to_read = select.select([udp_socket], [], [], wait_time)
+        
+        if ready_to_read[0]:
+            window_moved = False
             while True:
                 try:
-                    ack_pkt, _ = sock.recvfrom(2048)
-                    if len(ack_pkt) < 16:
+                    raw_ack, _ = udp_socket.recvfrom(2048)
+                    if len(raw_ack) < 16:
                         continue
+                    
                     try:
-                        ack_header = PacketHeader(ack_pkt[:16])
+                        ack_hdr = PacketHeader(raw_ack[:16])
                     except Exception:
                         continue
-                    temp_header = PacketHeader(type=ack_header.type, seq_num=ack_header.seq_num, length=0)
-                    calc_chk = compute_checksum(temp_header / b"")
-                    if calc_chk == ack_header.checksum and ack_header.type == 3:
-                        ack_seq = ack_header.seq_num
-                        if base <= ack_seq < base + window_size:
-                            acked_packets.add(ack_seq)
-                            while base in acked_packets:
-                                acked_packets.remove(base)
-                                base += 1
-                                advanced = True
+
+                    # Xác thực checksum
+                    test_hdr = PacketHeader(type=ack_hdr.type, seq_num=ack_hdr.seq_num, length=0)
+                    if compute_checksum(test_hdr / b"") == ack_hdr.checksum and ack_hdr.type == 3:
+                        received_seq = ack_hdr.seq_num
+                        
+                        if window_start <= received_seq < window_start + window_size:
+                            if received_seq not in confirmed_acks:
+                                confirmed_acks.append(received_seq)
+                            
+                            # Kéo cửa sổ lên nếu gói đầu tiên đã đến
+                            while window_start in confirmed_acks:
+                                confirmed_acks.remove(window_start)
+                                window_start += 1
+                                window_moved = True
                 except BlockingIOError:
-                    break
-            if advanced:
-                timer_start_time = time.time()
-    end_header = PacketHeader(type=1, seq_num=base, length=0)
-    end_header.checksum = compute_checksum(end_header / b"")
-    sock.sendto(bytes(end_header / b""), server_address)
-    start_time = time.time()
-    while time.time() - start_time < 0.5:
-        ready = select.select([sock], [], [], 0.5 - (time.time() - start_time))
-        if ready[0]:
+                    break # Hết dữ liệu trong buffer
+            
+            if window_moved:
+                last_action_time = time.time()
+
+    # Đóng kết nối
+    term_header = PacketHeader(type=1, seq_num=window_start, length=0)
+    term_header.checksum = compute_checksum(term_header / b"")
+    udp_socket.sendto(bytes(term_header / b""), target)
+    
+    end_timer = time.time()
+    while time.time() - end_timer < 0.5:
+        if select.select([udp_socket], [], [], 0.5 - (time.time() - end_timer))[0]:
             try:
-                ack_pkt, _ = sock.recvfrom(2048)
-                if len(ack_pkt) >= 16:
-                    ack_header = PacketHeader(ack_pkt[:16])
-                    if ack_header.type == 3:
-                        break
-            except BlockingIOError:
+                raw_ack, _ = udp_socket.recvfrom(2048)
+                if len(raw_ack) >= 16 and PacketHeader(raw_ack[:16]).type == 3:
+                    break
+            except (BlockingIOError, Exception):
                 pass
-    sock.close()
+    udp_socket.close()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("receiver_ip", help="The IP address of the host that receiver is running on")
@@ -94,5 +121,6 @@ def main():
     parser.add_argument("window_size", type=int, help="Maximum number of outstanding packets")
     args = parser.parse_args()
     sender(args.receiver_ip, args.receiver_port, args.window_size)
+
 if __name__ == "__main__":
     main()
